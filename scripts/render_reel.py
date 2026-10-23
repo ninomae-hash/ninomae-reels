@@ -1,577 +1,642 @@
-/**
- * ============================================================
- *  ninomae ONLINE 商品リール動画 → Instagram 自動投稿
- *
- *  流れ（すべて日本時間）
- *   1. 月・水・金の19時台：商品をランダムに選び、Geminiで動画の文字とキャプションを作り、
- *      GitHub（ninomae-reels）に動画づくりを依頼する
- *   2. GitHub が15秒の縦長動画を作り、GitHub Pages に公開する（2〜5分）
- *   3. 20〜22時のランダムな時刻：公開された動画をリールとして Instagram に投稿する
- *
- *  ※ product_auto_post.gs と同じプロジェクトに「新しいファイル」として追加してください。
- *    商品の取得・Gemini・Instagram投稿の部品はそちらの関数を共用しています。
- * ============================================================
- */
+#!/usr/bin/env python3
+"""
+ninomae ONLINE リール動画ジェネレーター（バズり型・TikTok／Instagram共通）
 
-// ===== 設定 =====
-const REEL_CONFIG = {
-  PAUSED: false,                    // true にするとリールの自動投稿を一時停止
+構成（14秒・縦長1080x1920・30fps、最後から最初へ自然につながるループ）
+  0.0〜2.5秒  つかみ：写真がグッと寄る＋大きな一言（例「枯れない花って知ってた？」）
+  2.5〜10.5秒 2秒ごとにテンポよく切り替え（全画面の寄りカット）＋短い一言
+  10.5〜14秒  商品名・価格・「プロフィールのリンクから」＋コメントを誘う問いかけ
+  BGM：なし（曲はTikTok・Instagramのアプリ内で付ける）。無音の音声トラックだけ入れる
+  ※切り替えは120BPM（2秒ごと）なので、流行の曲の拍に合わせやすい
 
-  GITHUB_OWNER: 'ninomae-hash',     // GitHub のユーザー名
-  GITHUB_REPO: 'ninomae-reels',     // リポジトリ名
-  PROP_GITHUB_TOKEN: 'GITHUB_TOKEN',// スクリプトプロパティに登録する GitHub のトークン名
-
-  DAYS: [1, 3, 5],                  // 投稿する曜日（1=月 2=火 3=水 4=木 5=金 6=土 7=日）
-  PREPARE_HOUR: 19,                 // 動画づくりを依頼する時刻（19時台）
-  PUBLISH_START_HOUR: 20,           // 投稿の時間帯：開始
-  PUBLISH_END_HOUR: 22,             // 投稿の時間帯：終了（この間のランダムな時刻）
-  RETRY_UNTIL_HOUR: 23,             // うまくいかないときの再挑戦はこの時刻まで
-
-  SHARE_TO_FEED: true,              // リールをプロフィールのフィード（投稿一覧）にも表示する
-  POST_TO_FACEBOOK: true,           // Facebookページにも動画を投稿する
-  BRAND: 'ninomae ONLINE',          // 動画の上部に出す名前
-
-  // Instagramへの投稿方法
-  //   false：自動投稿しない。動画ができたら、Instagram用とTikTok用のキャプションをメールで送る
-  //          → アプリで流行の曲を付けて手動で投稿（Facebookへは投稿画面の「Facebookにもシェア」で）
-  //   true ：Instagramへ自動投稿（API投稿のため曲は付けられず、無音のリールになります）
-  INSTAGRAM_AUTO_POST: false,
-
-  // 投稿用メール（動画の添付とキャプション）
-  TIKTOK_MAIL: true,
-  TIKTOK_MAIL_TO: 'info.ninomae@gmail.com',
-};
-
-const REEL_STATE = {
-  JOB: 'REEL_JOB',                  // 進行中のリール（1件）
-  ROTATED: 'REEL_ROTATED_IDS',      // 今の周回でリールにした商品
-};
-
-const REEL_TZ = 'Asia/Tokyo';
-
-
-// ============================================================
-//  1. セットアップ・テスト用（手動で実行）
-// ============================================================
-
-/** 設定の確認：GitHubのトークンとリポジトリにつながるかを確かめる */
-function checkReelConfig() {
-  const token = reelGithubToken_();
-  if (!token) {
-    Logger.log('⚠ スクリプトプロパティ「' + REEL_CONFIG.PROP_GITHUB_TOKEN + '」がありません。GitHubのトークンを登録してください');
-    return;
+入力（環境変数 PAYLOAD に JSON）:
+  {
+    "job_id": "20261026-1930-161509504",
+    "images": ["https://...jpg", ...],                 # 商品写真（1〜6枚）
+    "slides": ["つかみ", "一言1", "一言2", "一言3", "一言4"],
+    "question": "どの色が好き？コメントで教えてね",
+    "title": "プリザーブドフラワー「プティットボックス イエロー」｜…",
+    "price": "¥7,150（税込）",
+    "brand": "ninomae ONLINE"
   }
-  const res = UrlFetchApp.fetch('https://api.github.com/repos/' + REEL_CONFIG.GITHUB_OWNER + '/' + REEL_CONFIG.GITHUB_REPO, {
-    headers: reelGithubHeaders_(token), muteHttpExceptions: true,
-  });
-  if (res.getResponseCode() !== 200) {
-    Logger.log('⚠ リポジトリにつながりません（HTTP ' + res.getResponseCode() + '）。ユーザー名・リポジトリ名・トークンの権限を確認してください\n' + res.getContentText().slice(0, 300));
-    return;
-  }
-  const repo = JSON.parse(res.getContentText());
-  Logger.log('✅ GitHub OK：' + repo.full_name + '（' + (repo.private ? '非公開' : '公開') + '）');
-  if (repo.private) Logger.log('⚠ リポジトリが「非公開」です。GitHub Pages で動画を公開するには「公開（Public）」にしてください');
-  Logger.log('■ 動画の公開先：' + reelPagesBase_() + '/reels/');
-  Logger.log('■ 投稿する曜日：' + REEL_CONFIG.DAYS.map(d => '月火水木金土日'.charAt(d - 1)).join('・')
-    + '／' + REEL_CONFIG.PUBLISH_START_HOUR + '〜' + REEL_CONFIG.PUBLISH_END_HOUR + '時（日本時間）');
-}
+出力: out/<job_id>.mp4
+"""
+import glob
+import json
+import math
+import os
+import random
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import wave
 
-/** 【動画だけ作る】ランダムな商品で動画を作り、公開URLをログに出す（Instagramには投稿しない） */
-function reelTestRender() {
-  const item = reelPickItem_(false);
-  if (!item) return;
-  const texts = reelBuildSlides_(item);
-  const jobId = Utilities.formatDate(new Date(), REEL_TZ, 'yyyyMMdd-HHmm') + '-test-' + item.id;
-  reelDispatch_(reelPayload_(jobId, item, texts));
-  Logger.log('🎬 動画づくりを依頼しました：' + item.name);
-  Logger.log('　動画の文字：' + texts.slides.join(' ／ ') + ' ／（問いかけ）' + texts.question);
-  Logger.log('→ 3〜5分後に次のURLを開くと動画を確認できます\n' + reelVideoUrl_(jobId));
-}
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-/** 【今すぐ1本】曜日に関係なく動画を作り、約8分後に投稿用メールを送る（自動投稿モードならInstagramへ投稿） */
-function reelPostNow() {
-  reelPrepare_({ publishInMinutes: 8 });
-}
+try:
+    import numpy as np
+except ImportError:  # GitHub Actions などで未インストールなら自動で入れる
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "numpy"], check=True)
+    import numpy as np
 
-/** トリガーを設定する（毎日19時台に「今日は投稿日か」を確認し、投稿日なら準備する） */
-function setupReelTriggers() {
-  reelDeleteTriggers_(['reelDailyPrepare', 'reelPrepareRetry', 'reelPublish']);
-  ScriptApp.newTrigger('reelDailyPrepare').timeBased()
-    .atHour(REEL_CONFIG.PREPARE_HOUR).everyDays(1).inTimezone(REEL_TZ).create();
-  Logger.log('✅ リールのトリガーを設定しました（毎日' + REEL_CONFIG.PREPARE_HOUR + '時台に確認 → 投稿日なら'
-    + REEL_CONFIG.PUBLISH_START_HOUR + '〜' + REEL_CONFIG.PUBLISH_END_HOUR + '時に'
-    + (REEL_CONFIG.INSTAGRAM_AUTO_POST ? 'Instagramへ自動投稿' : '投稿用メールを送信') + '）');
-}
+W, H = 1080, 1920
+FPS = 30
+BPM = 120
+BEAT = 60 / BPM                     # 0.5秒
+HOOK_SEC = 2.5                      # つかみ
+MID_SEC = 2.0                       # 途中のカット（4つ）
+END_SEC = 3.5                       # 最後（商品名・価格・問いかけ）
+N_MID = 4
+TOTAL_SEC = HOOK_SEC + MID_SEC * N_MID + END_SEC   # 14.0秒
+LOOP_ZOOM = 0.10
+# BGM："none"＝音なし（曲はTikTok・Instagramのアプリで付ける）／"musicbox"＝オルゴール風の自作曲
+# ※音なしでも、SNSが受け付けやすいように「無音の音声トラック」は入れておく
+BGM_MODE = "none"                    # 最後のカットの終わり＝最初のカットの始まりの寄り具合（ループ用）
+OUT_DIR = "out"
 
-/** 今の状況を確認する */
-function reelStatus() {
-  const job = productGetJson_(REEL_STATE.JOB, null);
-  Logger.log(job ? '進行中のリール：\n' + JSON.stringify(job, null, 2) : '進行中のリールはありません');
-  const rotated = productGetJson_(REEL_STATE.ROTATED, []);
-  Logger.log('今の周回でリールにした商品：' + rotated.length + '件');
-  ScriptApp.getProjectTriggers()
-    .filter(t => /^reel/.test(t.getHandlerFunction()))
-    .forEach(t => Logger.log('トリガー：' + t.getHandlerFunction()));
-}
+# ---- 色（ninomae ONLINE のテーマに合わせたピンク系） ----
+CREAM = (252, 246, 241)
+BLUSH = (246, 226, 228)
+PINK = (236, 184, 196)
+DEEP_PINK = (214, 112, 146)
+MAUVE = (153, 102, 145)
+TEXT = (112, 82, 98)
+WHITE = (255, 255, 255)
 
-/** 進行中のリールを取り消す（投稿予約も消す） */
-function reelCancel() {
-  PropertiesService.getScriptProperties().deleteProperty(REEL_STATE.JOB);
-  reelDeleteTriggers_(['reelPublish', 'reelPrepareRetry']);
-  Logger.log('進行中のリールと投稿予約を取り消しました');
-}
+# ---- Instagram／TikTokのボタン・キャプションに隠れない範囲 ----
+SAFE_TOP, SAFE_BOTTOM = 230, H - 430
+SAFE_RIGHT = W - 140
+HOOK_CENTER_Y = 470                 # つかみの文字（上のほう）
+MID_CENTER_Y = 1330                 # 途中の一言（下のほう）
+TEXT_MAX_W = 860
 
-
-// ============================================================
-//  2. トリガーで動く関数
-// ============================================================
-
-/** 毎日19時台：投稿日なら準備する */
-function reelDailyPrepare() {
-  if (REEL_CONFIG.PAUSED) { Logger.log('リールの自動投稿は一時停止中です'); return; }
-  const weekday = Number(Utilities.formatDate(new Date(), REEL_TZ, 'u')); // 1=月〜7=日
-  if (REEL_CONFIG.DAYS.indexOf(weekday) < 0) { Logger.log('今日はリールの投稿日ではありません'); return; }
-  reelPrepare_({});
-}
-
-/** Geminiの一時的な失敗などで準備をやり直すとき用 */
-function reelPrepareRetry() {
-  reelDeleteTriggers_(['reelPrepareRetry']);
-  if (REEL_CONFIG.PAUSED) return;
-  reelPrepare_({});
-}
-
-/** 動画の公開を待って Instagram にリールとして投稿する */
-function reelPublish() {
-  reelDeleteTriggers_(['reelPublish']);
-  const locked = productWithLock_(() => {
-    const job = productGetJson_(REEL_STATE.JOB, null);
-    if (!job || job.status === 'done') { Logger.log('投稿待ちのリールはありません'); return; }
-
-    if (Date.now() > (job.deadline || reelTodayAt_(REEL_CONFIG.RETRY_UNTIL_HOUR).getTime())) {
-      PropertiesService.getScriptProperties().deleteProperty(REEL_STATE.JOB);
-      throw new Error('リールを時間内に投稿できなかったため、今日は見送りました（' + job.itemName + '）。最後の状況：' + (job.lastNote || '不明'));
-    }
-
-    // ① 動画が公開されているか確認
-    if (!job.containerId) {
-      const check = UrlFetchApp.fetch(job.videoUrl, { muteHttpExceptions: true, followRedirects: true });
-      if (check.getResponseCode() !== 200) {
-        reelSaveNote_(job, '動画の公開待ち（HTTP ' + check.getResponseCode() + '）');
-        reelScheduleRetry_(10, '動画がまだ公開されていません');
-        return;
-      }
-
-      // 手動投稿モード：Instagramには投稿せず、投稿用メールを送って完了
-      if (!REEL_CONFIG.INSTAGRAM_AUTO_POST) {
-        reelFinishManual_(job);
-        return;
-      }
-
-      // ② Instagram にリールの下書き（コンテナ）を作る
-      const ig = productIgBase_();
-      try {
-        const c = productIgCall_('post', ig.userId + '/media', {
-          media_type: 'REELS',
-          video_url: job.videoUrl,
-          caption: job.caption,
-          share_to_feed: REEL_CONFIG.SHARE_TO_FEED ? 'true' : 'false',
-        });
-        job.containerId = c.id;
-        reelSaveNote_(job, 'Instagramで動画を処理中');
-      } catch (e) {
-        if (productIsFatalError_(e)) throw e;
-        reelSaveNote_(job, 'コンテナ作成に失敗: ' + e.message);
-        reelScheduleRetry_(15, e.message);
-        return;
-      }
-    }
-
-    // ③ Instagram 側の動画処理が終わるのを待つ（最大 約4分。終わらなければ5分後に続きから）
-    for (let i = 0; i < 9; i++) {
-      let st;
-      try {
-        st = productIgCall_('get', job.containerId, { fields: 'status_code,status' });
-      } catch (e) {
-        if (productIsFatalError_(e)) throw e;
-        Utilities.sleep(20000);
-        continue;
-      }
-      if (st.status_code === 'FINISHED') {
-        reelFinish_(job);
-        return;
-      }
-      if (st.status_code === 'ERROR' || st.status_code === 'EXPIRED') {
-        PropertiesService.getScriptProperties().deleteProperty(REEL_STATE.JOB);
-        throw new Error('Instagramが動画を受け付けませんでした（' + st.status_code + '）: ' + (st.status || '') + ' / ' + job.videoUrl);
-      }
-      Utilities.sleep(25000);
-    }
-    reelSaveNote_(job, 'Instagramで動画を処理中（時間がかかっています）');
-    reelScheduleRetry_(5, 'Instagramの動画処理が終わっていません');
-  });
-  if (!locked) reelScheduleRetry_(5, '他の処理と重なったため');
+HERE = os.path.dirname(os.path.abspath(__file__))
+FONT_DIRS = [os.path.join(HERE, "..", "fonts"), "fonts"]
+NOTO_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+]
+# Google Fonts（OFLライセンス・商用利用可）。初回に自動でダウンロード
+FONT_URLS = {
+    "ZenMaruGothic-Black.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/zenmarugothic/ZenMaruGothic-Black.ttf",
+    "ZenMaruGothic-Bold.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/zenmarugothic/ZenMaruGothic-Bold.ttf",
+    "DancingScript-VF.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/dancingscript/DancingScript%5Bwght%5D.ttf",
 }
 
 
-// ============================================================
-//  3. 中身の処理
-// ============================================================
-
-/** 商品を選び、文字とキャプションを作り、GitHubに動画づくりを依頼して、投稿を予約する */
-function reelPrepare_(opts) {
-  const existing = productGetJson_(REEL_STATE.JOB, null);
-  if (existing && existing.status !== 'done' && existing.day === reelToday_()) {
-    Logger.log('今日のリールはすでに準備済みです：' + existing.itemName);
-    return;
-  }
-
-  const item = reelPickItem_(true);
-  if (!item) return;
-
-  let texts, caption;
-  try {
-    texts = reelBuildSlides_(item);
-    caption = productBuildCaption_(item, 'rotation'); // 商品投稿と同じ型のキャプション
-  } catch (e) {
-    if (e.captionFailed || /Gemini/.test(e.message)) {
-      if (reelHourJst_() < REEL_CONFIG.PUBLISH_END_HOUR - 1) {
-        ScriptApp.newTrigger('reelPrepareRetry').timeBased().at(new Date(Date.now() + 30 * 60 * 1000)).create();
-        Logger.log('⏸ 文字の作成に失敗したため、30分後にやり直します：' + e.message);
-      } else {
-        Logger.log('⏸ 文字の作成に失敗し、時間内にやり直せないため今日は見送ります：' + e.message);
-      }
-      return;
-    }
-    throw e;
-  }
-
-  const jobId = Utilities.formatDate(new Date(), REEL_TZ, 'yyyyMMdd-HHmm') + '-' + item.id;
-  reelDispatch_(reelPayload_(jobId, item, texts));
-
-  const job = {
-    id: jobId, day: reelToday_(), itemId: item.id, itemName: item.name,
-    videoUrl: reelVideoUrl_(jobId), caption: caption, status: 'rendering',
-    slides: texts.slides, question: texts.question, url: item.url,
-    price: item.price ? '¥' + item.price.toLocaleString('ja-JP') + '（税込）' : '',
-  };
-  productSetJson_(REEL_STATE.JOB, job);
-
-  // 投稿時刻を決める（動画づくりに最低15分の余裕を見る）
-  let runAt;
-  if (opts && opts.publishInMinutes) {
-    runAt = new Date(Date.now() + opts.publishInMinutes * 60 * 1000);
-  } else {
-    const start = reelTodayAt_(REEL_CONFIG.PUBLISH_START_HOUR).getTime();
-    const end = reelTodayAt_(REEL_CONFIG.PUBLISH_END_HOUR).getTime();
-    const from = Math.max(start, Date.now() + 15 * 60 * 1000);
-    runAt = new Date(from >= end ? from : from + Math.floor(Math.random() * (end - from)));
-  }
-  // 再挑戦の期限：通常は23時。テストで夜遅くに実行した場合は投稿予定の2時間後まで
-  job.deadline = Math.max(reelTodayAt_(REEL_CONFIG.RETRY_UNTIL_HOUR).getTime(), runAt.getTime() + 2 * 3600 * 1000);
-  productSetJson_(REEL_STATE.JOB, job);
-  reelDeleteTriggers_(['reelPublish']);
-  ScriptApp.newTrigger('reelPublish').timeBased().at(runAt).create();
-
-  Logger.log('🎬 リールを準備しました：' + item.name);
-  Logger.log('　動画の文字：' + texts.slides.join(' ／ ') + ' ／（問いかけ）' + texts.question);
-  Logger.log('📅 ' + Utilities.formatDate(runAt, REEL_TZ, 'M/d HH:mm') + '（日本時間）に投稿します');
-  Logger.log('　動画URL：' + job.videoUrl);
-}
-
-/** 商品を1つ選ぶ（今の周回でまだリールにしていない商品からランダム。売り切れ・画像なしは除く） */
-function reelPickItem_(useRotation) {
-  const ids = productGetAllIds_();
-  if (!ids.length) { Logger.log('商品一覧を取得できませんでした'); return null; }
-  let rotated = useRotation ? productGetJson_(REEL_STATE.ROTATED, []) : [];
-  let candidates = ids.filter(id => rotated.indexOf(id) < 0);
-  if (!candidates.length) {
-    candidates = ids;
-    if (useRotation) { productSetJson_(REEL_STATE.ROTATED, []); Logger.log('全商品をリールにしたので最初から'); }
-  }
-  candidates = productShuffle_(candidates);
-  for (let i = 0; i < candidates.length && i < 6; i++) {
-    const item = productGetDetail_(candidates[i]);
-    if (item && !item.soldOut && item.images.length) return item;
-  }
-  Logger.log('リールにできる商品が見つかりませんでした');
-  return null;
-}
-
-/**
- * バズり型の動画に重ねる文字を Gemini で作る
- * 戻り値：{ slides: [つかみ, 一言1, 一言2, 一言3, 一言4], question: 問いかけ }
- */
-function reelBuildSlides_(item) {
-  const prompt = [
-    'あなたはプリザーブドフラワー専門店「ninomae ONLINE」のTikTok・Instagramリール担当です。',
-    '14秒の商品紹介動画に重ねる短い文字を作ってください。最初の1秒で指が止まる動画にしたいです。',
-    '',
-    '【作るもの】',
-    '・hook（つかみ）：最初に大きく出す一言。8〜14文字。思わず続きを見たくなる問いかけや意外な事実',
-    '　例：「枯れない花って知ってた？」「まだ生花を贈ってるの？」「この花、水やりいらないんです」',
-    '・lines：2秒ごとに出す短い一言を4つ。各6〜12文字。テンポよく、商品の魅力→特長→贈るシーンの順',
-    '　例：「手のひらサイズの幸せ」「水やり不要でずっと可愛い」「ちょっとしたお礼にぴったり」',
-    '・question：最後に出す、コメントしたくなる問いかけ。16〜22文字',
-    '　例：「あなたなら誰に贈る？コメントで教えてね」「何色が好き？コメントで教えてね」',
-    '',
-    '【条件】',
-    '・絵文字・ハッシュタグ・記号の多用は禁止。話し言葉でやわらかく',
-    '・商品名と価格は入れない（最後に別で表示します）',
-    '・商品情報に書かれていないこと（サイズ・期限・効果など）は作らない。大げさな表現や「必ず」「絶対」は使わない',
-    '',
-    '【出力形式】次のJSONだけを出力：',
-    '{"hook": "…", "lines": ["…", "…", "…", "…"], "question": "…"}',
-    '',
-    '【商品情報】',
-    '商品名：' + item.name,
-    '説明：' + item.description,
-  ].join('\n');
-
-  const tidy = v => String(v || '').replace(/[#＃]\S+/g, '').replace(/\s+/g, ' ').trim();
-  let lastErr;
-  for (let i = 0; i < 2; i++) {
-    try {
-      const raw = productCallGemini_(prompt, true);
-      const m = String(raw).replace(/```[a-z]*/gi, '').match(/\{[\s\S]*\}/);
-      if (!m) throw new Error('JSON形式で返ってきませんでした');
-      const obj = JSON.parse(m[0]);
-      const hook = tidy(obj.hook);
-      const lines = (obj.lines || []).map(tidy).filter(Boolean).slice(0, 4);
-      const question = tidy(obj.question);
-      if (!hook || lines.length < 4) throw new Error('文字がそろいませんでした');
-      return { slides: [hook].concat(lines), question: question || 'あなたなら誰に贈る？コメントで教えてね' };
-    } catch (e) {
-      lastErr = e;
-      if (/Gemini API エラー/.test(e.message)) break; // API自体の失敗は作り直しても同じ
-    }
-  }
-  const err = new Error('Gemini：動画の文字を作れませんでした: ' + (lastErr && lastErr.message));
-  err.captionFailed = true;
-  throw err;
-}
-
-function reelPayload_(jobId, item, texts) {
-  return {
-    job_id: jobId,
-    images: item.images.slice(0, 6),      // 写真は最大6枚（テンポよく切り替えるため）
-    slides: texts.slides,
-    question: texts.question,
-    title: item.name,
-    price: item.price ? '¥' + item.price.toLocaleString('ja-JP') + '（税込）' : '',
-    brand: REEL_CONFIG.BRAND,
-  };
-}
-
-/** GitHub に「動画を作って」と依頼する */
-function reelDispatch_(payload) {
-  const token = reelGithubToken_();
-  if (!token) throw new Error('スクリプトプロパティ「' + REEL_CONFIG.PROP_GITHUB_TOKEN + '」（GitHubのトークン）がありません');
-  const res = UrlFetchApp.fetch('https://api.github.com/repos/' + REEL_CONFIG.GITHUB_OWNER + '/' + REEL_CONFIG.GITHUB_REPO + '/dispatches', {
-    method: 'post',
-    contentType: 'application/json',
-    headers: reelGithubHeaders_(token),
-    payload: JSON.stringify({ event_type: 'render-reel', client_payload: payload }),
-    muteHttpExceptions: true,
-  });
-  const code = res.getResponseCode();
-  if (code !== 204) {
-    throw new Error('GitHubへの依頼に失敗しました（HTTP ' + code + '）。'
-      + (code === 401 ? 'トークンが無効か期限切れです。' : code === 403 || code === 404 ? 'トークンの権限（Contents: Read and write）とリポジトリ名を確認してください。' : '')
-      + res.getContentText().slice(0, 200));
-  }
-}
-
-/** 投稿完了の処理 */
-function reelFinish_(job) {
-  const ig = productIgBase_();
-  const pub = productIgCall_('post', ig.userId + '/media_publish', { creation_id: job.containerId });
-  job.status = 'done';
-  job.mediaId = pub.id;
-  job.lastNote = '投稿完了';
-  productSetJson_(REEL_STATE.JOB, job);
-
-  const rotated = productGetJson_(REEL_STATE.ROTATED, []);
-  if (rotated.indexOf(job.itemId) < 0) { rotated.push(job.itemId); productSetJson_(REEL_STATE.ROTATED, rotated); }
-  Logger.log('✅ リールを投稿しました：' + job.itemName + ' / Media ID: ' + pub.id);
-
-  if (REEL_CONFIG.POST_TO_FACEBOOK) {
-    try {
-      reelFbPostVideo_(job.videoUrl, job.caption);
-    } catch (e) {
-      Logger.log('Facebook動画の投稿失敗: ' + e.message
-        + (/access token|session/i.test(e.message) ? '\n→ FB_PAGE_ACCESS_TOKEN が無効です。ページアクセストークンを再発行してください' : ''));
-    }
-  }
-
-  if (REEL_CONFIG.TIKTOK_MAIL) {
-    try {
-      reelSendTiktokMail_(job, false);
-    } catch (e) {
-      Logger.log('TikTok用メールの送信失敗: ' + e.message);
-    }
-  }
-}
+def log(msg):
+    print(msg, flush=True)
 
 
-// ============================================================
-//  TikTok用（半自動）：動画とキャプションをメールで送る → スマホのTikTokアプリから投稿
-// ============================================================
+# ============================================================
+#  フォント
+# ============================================================
 
-/** TikTok用の短いキャプションを作る（ハッシュタグはInstagramと同じ5個） */
-function reelTiktokCaption_(job) {
-  const name = String(job.itemName || '');
-  const m = name.match(/[「『](.+?)[」』]/);
-  const shortName = m ? m[1] : name.split(/[｜|]/)[0].trim();
-  const tagLine = String(job.caption || '').split('\n').filter(l => /^\s*#/.test(l)).pop()
-    || productBuildHashtags_([]);
-  return [
-    (job.slides && job.slides[0]) ? job.slides[0] : '',
-    shortName + (job.price ? '　' + job.price : ''),
-    '商品はプロフィールのリンクから',
-    job.question || '',
-    '',
-    tagLine,
-  ].filter((l, i) => l || i === 4).join('\n').trim();
-}
-
-/** 手動投稿モードの完了処理：投稿用メール（Instagram・TikTok）を送る */
-function reelFinishManual_(job) {
-  reelSendTiktokMail_(job, true);
-  job.status = 'done';
-  job.lastNote = '投稿用メールを送信';
-  productSetJson_(REEL_STATE.JOB, job);
-  const rotated = productGetJson_(REEL_STATE.ROTATED, []);
-  if (rotated.indexOf(job.itemId) < 0) { rotated.push(job.itemId); productSetJson_(REEL_STATE.ROTATED, rotated); }
-  Logger.log('✅ リール動画を用意し、投稿用メールを送りました：' + job.itemName);
-}
-
-/**
- * 投稿用メールを送る（動画を添付）
- * withInstagram が true のときは、Instagram用のキャプションと手順も入れる
- */
-function reelSendTiktokMail_(job, withInstagram) {
-  const ttCaption = reelTiktokCaption_(job);
-  const igCaption = job.caption || '';
-  const day = Utilities.formatDate(new Date(), REEL_TZ, 'M/d');
-  const label = withInstagram ? '【Instagram・TikTok用】' : '【TikTok用】';
-  const subject = label + 'リール動画 ' + day + '：' + String(job.itemName || '').split(/[｜|]/)[0].trim();
-
-  // 動画を添付（スマホでそのまま保存できるように）。取得できなければリンクだけ送る
-  const attachments = [];
-  try {
-    const res = UrlFetchApp.fetch(job.videoUrl, { muteHttpExceptions: true });
-    if (res.getResponseCode() === 200) attachments.push(res.getBlob().setName('ninomae_' + job.id + '.mp4').setContentType('video/mp4'));
-  } catch (e) {}
-
-  const sections = [];
-  if (withInstagram) {
-    sections.push({
-      title: 'Instagram（リール）',
-      steps: ['添付の動画をスマホに保存', 'Instagramアプリの「＋」→「リール」→ 動画を選ぶ',
-              '「音楽」から流行の曲を選ぶ（動画は無音です）', '「次へ」→ 下のキャプションを貼り付け',
-              '「Facebookにおすすめ」（Facebookにもシェア）をオンにして「シェア」'],
-      caption: igCaption,
-    });
-  }
-  sections.push({
-    title: 'TikTok',
-    steps: ['添付の動画をスマホに保存', 'TikTokアプリの「＋」→ 動画を選ぶ',
-            '「サウンドを追加」で流行の曲を選ぶ（動画は無音です）', '下のキャプションを貼り付けて投稿'],
-    caption: ttCaption,
-  });
-
-  const esc = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const lines = ['今日のリール動画をお送りします。投稿は1つにつき約1分です。', ''];
-  let html = '<div style="font-family:sans-serif;line-height:1.7"><p>今日のリール動画をお送りします。投稿は1つにつき約1分です。</p>';
-  sections.forEach(sec => {
-    lines.push('━━━━━━━━━━', '■ ' + sec.title, '━━━━━━━━━━');
-    sec.steps.forEach((st, k) => lines.push((k + 1) + '. ' + st));
-    lines.push('', '▼ キャプション（ここから下をコピー）', sec.caption, '');
-    html += '<h3 style="color:#996691;border-bottom:2px solid #ecb8c4;padding-bottom:4px">' + esc(sec.title) + '</h3>'
-      + '<p>' + sec.steps.map((st, k) => (k + 1) + '. ' + esc(st)).join('<br>') + '</p>'
-      + '<p><b>キャプション</b>（枠の中を長押しでコピー）</p>'
-      + '<pre style="white-space:pre-wrap;background:#f6f1f3;padding:12px;border-radius:8px;font-family:sans-serif">' + esc(sec.caption) + '</pre>';
-  });
-  lines.push('■ 動画リンク', job.videoUrl, '', '■ 商品ページ', job.url || '');
-  html += '<p><b>動画リンク</b><br><a href="' + esc(job.videoUrl) + '">' + esc(job.videoUrl) + '</a></p>'
-    + (job.url ? '<p><b>商品ページ</b><br><a href="' + esc(job.url) + '">' + esc(job.url) + '</a></p>' : '')
-    + '</div>';
-
-  MailApp.sendEmail({ to: REEL_CONFIG.TIKTOK_MAIL_TO, subject: subject, body: lines.join('\n'), htmlBody: html, attachments: attachments, name: 'ninomae 自動投稿' });
-  Logger.log('📩 投稿用の動画とキャプションを ' + REEL_CONFIG.TIKTOK_MAIL_TO + ' に送りました' + (attachments.length ? '（動画添付あり）' : '（リンクのみ）'));
-}
-
-/** 【テスト】直近のリールで、投稿用メールをもう一度送る */
-function reelTestTiktokMail() {
-  const job = productGetJson_(REEL_STATE.JOB, null);
-  if (!job) { Logger.log('送れるリールがありません。先に reelPostNow などでリールを1本作ってください'); return; }
-  reelSendTiktokMail_(job, !REEL_CONFIG.INSTAGRAM_AUTO_POST);
-}
-
-function reelFbPostVideo_(videoUrl, description) {
-  const props = PropertiesService.getScriptProperties();
-  const pageId = props.getProperty(PRODUCT_CONFIG.PROP_FB_PAGE_ID);
-  const token = props.getProperty(PRODUCT_CONFIG.PROP_FB_TOKEN);
-  if (!pageId || !token) { Logger.log('FB設定がないためFacebook投稿はスキップ'); return; }
-  const res = UrlFetchApp.fetch('https://graph.facebook.com/' + PRODUCT_CONFIG.GRAPH_VERSION + '/' + pageId + '/videos', {
-    method: 'post',
-    payload: { file_url: videoUrl, description: description, access_token: token },
-    muteHttpExceptions: true,
-  });
-  const json = JSON.parse(res.getContentText());
-  if (json.error) throw new Error(json.error.message);
-  Logger.log('✅ Facebookにも動画を投稿しました: ' + json.id);
-}
+def download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        f.write(r.read())
+    return dest
 
 
-// ============================================================
-//  4. 小さな部品
-// ============================================================
+def _find(name):
+    for d in FONT_DIRS:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return None
 
-function reelGithubToken_() {
-  return (PropertiesService.getScriptProperties().getProperty(REEL_CONFIG.PROP_GITHUB_TOKEN) || '').trim();
-}
 
-function reelGithubHeaders_(token) {
-  return { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
-}
+def ensure_fonts():
+    folder = FONT_DIRS[0]
+    os.makedirs(folder, exist_ok=True)
+    for name, url in FONT_URLS.items():
+        if _find(name):
+            continue
+        try:
+            download(url, os.path.join(folder, name))
+            log(f"フォントを取得: {name}")
+        except Exception as e:
+            log(f"フォントを取得できませんでした（代わりのフォントを使います）: {name} / {e}")
 
-function reelPagesBase_() {
-  return 'https://' + REEL_CONFIG.GITHUB_OWNER.toLowerCase() + '.github.io/' + REEL_CONFIG.GITHUB_REPO;
-}
 
-function reelVideoUrl_(jobId) {
-  return reelPagesBase_() + '/reels/' + jobId + '.mp4';
-}
+_font_cache = {}
 
-function reelToday_() {
-  return Utilities.formatDate(new Date(), REEL_TZ, 'yyyy-MM-dd');
-}
 
-function reelHourJst_() {
-  return Number(Utilities.formatDate(new Date(), REEL_TZ, 'H'));
-}
+def jp_font(size, weight="black"):
+    """丸文字（Zen Maru Gothic）。black=極太（字幕用）、bold=太字"""
+    key = ("jp", size, weight)
+    if key not in _font_cache:
+        name = "ZenMaruGothic-Black.ttf" if weight == "black" else "ZenMaruGothic-Bold.ttf"
+        path = _find(name) or _find("ZenMaruGothic-Bold.ttf")
+        if path:
+            _font_cache[key] = ImageFont.truetype(path, size)
+        else:
+            noto = next((p for p in NOTO_CANDIDATES if os.path.exists(p)), None)
+            if not noto:
+                sys.exit("日本語フォントが見つかりません")
+            _font_cache[key] = ImageFont.truetype(noto, size, index=0)
+    return _font_cache[key]
 
-function reelTodayAt_(hour) {
-  return new Date(reelToday_() + 'T' + ('0' + hour).slice(-2) + ':00:00+09:00');
-}
 
-function reelSaveNote_(job, note) {
-  job.lastNote = note;
-  productSetJson_(REEL_STATE.JOB, job);
-}
+def script_font(size):
+    key = ("script", size)
+    if key not in _font_cache:
+        path = _find("DancingScript-VF.ttf")
+        if path:
+            f = ImageFont.truetype(path, size)
+            try:
+                f.set_variation_by_axes([700])
+            except Exception:
+                pass
+            _font_cache[key] = f
+        else:
+            _font_cache[key] = jp_font(size, "bold")
+    return _font_cache[key]
 
-/** 数分後に reelPublish をもう一度動かす */
-function reelScheduleRetry_(minutes, reason) {
-  const runAt = new Date(Date.now() + minutes * 60 * 1000);
-  reelDeleteTriggers_(['reelPublish']);
-  ScriptApp.newTrigger('reelPublish').timeBased().at(runAt).create();
-  Logger.log('⏸ ' + reason + ' → ' + Utilities.formatDate(runAt, REEL_TZ, 'HH:mm') + '（日本時間）に再挑戦します');
-}
 
-function reelDeleteTriggers_(names) {
-  ScriptApp.getProjectTriggers()
-    .filter(t => names.indexOf(t.getHandlerFunction()) >= 0)
-    .forEach(t => ScriptApp.deleteTrigger(t));
-}
+def has_glyph(fnt, ch):
+    try:
+        return fnt.getmask(ch).getbbox() is not None
+    except Exception:
+        return False
+
+
+# ============================================================
+#  文字の整形
+# ============================================================
+
+def clean_text(s, limit=40):
+    s = str(s or "")
+    s = re.sub(r"[\U00010000-\U0010FFFF☀-♠♢-♤♦-➿️‍]", "", s)
+    return s.strip()[:limit]
+
+
+def short_title(name):
+    name = str(name or "")
+    m = re.search(r"[「『](.+?)[」』]", name)
+    if m:
+        return m.group(1).strip()
+    return re.split(r"[｜|]", name)[0].strip()
+
+
+NO_LINE_START = "、。，．！？!?」』）)ー～〜ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ・♡"
+NO_LINE_END = "「『（("
+GOOD_BREAK_AFTER = "、。！？!? 　"
+PARTICLES = "をにがはでとへもや"
+
+
+def script_of(ch):
+    o = ord(ch)
+    if 0x30A0 <= o <= 0x30FF:
+        return "kata"
+    if 0x4E00 <= o <= 0x9FFF:
+        return "kanji"
+    if 0x3040 <= o <= 0x309F:
+        return "hira"
+    return "other"
+
+
+def greedy_wrap(text, fnt, max_width, draw):
+    lines, line = [], ""
+    for ch in text:
+        test = line + ch
+        if draw.textlength(test, font=fnt) <= max_width or not line or ch in NO_LINE_START:
+            line = test
+        else:
+            lines.append(line)
+            line = ch
+    if line:
+        lines.append(line)
+    return lines
+
+
+def break_penalty(text, i, size):
+    """text の i 文字目の前で改行したときの「読みにくさ」（小さいほど自然）"""
+    a, b = text[i - 1], text[i]
+    sa, sb = script_of(a), script_of(b)
+    p = 0.0
+    if a in GOOD_BREAK_AFTER:
+        p -= 4                                   # 読点・句点のあと
+    elif a in PARTICLES:
+        p -= 2.5                                 # 助詞のあと（文節の切れ目）
+    if sa == sb and sa in ("kata", "kanji"):
+        p += 1.5                                 # 漢字・カタカナの語の途中
+    if sa == "hira" and sb in ("kanji", "kata"):
+        p += 3 if a in "おご" else -1.5           # 「お｜礼」はダメ、「って｜知ってた」は良い
+    if b in "おご" and i + 1 < len(text) and script_of(text[i + 1]) == "kanji" and sa == "hira":
+        p -= 2.5                                 # 「自分への｜ご褒美」
+    if sa in ("kanji", "kata") and sb == "hira":
+        p += 2                                   # 「花束｜が」のような送り仮名・助詞の前
+    if sa == "hira" and sb == "hira" and a not in PARTICLES:
+        p += 1                                   # 「開け｜た」などひらがなの途中
+    if b in PARTICLES + "のね" and sa in ("hira", "kanji", "kata"):
+        p += 3                                   # 行の頭に助詞（「の」「も」など）が来ないように
+    if a in "っゃゅょぁぃぅぇぉッャュョ":
+        p += 4                                   # 小さい「っ」などの直後
+    return p
+
+
+def smart_wrap(text, fnt, max_width, draw, max_lines=2):
+    """1行に収まればそのまま。2行なら自然な区切りで、左右が近い長さになる位置で改行。
+    戻り値：(行のリスト, 区切りの読みにくさ)"""
+    text = text.replace("\n", "")
+    if draw.textlength(text, font=fnt) <= max_width:
+        return [text], -99
+    if max_lines >= 2:
+        best, best_score, best_pen = None, None, None
+        for i in range(1, len(text)):
+            a, b = text[:i].rstrip(), text[i:].lstrip()
+            if not a or not b or b[0] in NO_LINE_START or a[-1] in NO_LINE_END:
+                continue
+            wa, wb = draw.textlength(a, font=fnt), draw.textlength(b, font=fnt)
+            if wa > max_width or wb > max_width:
+                continue
+            pen = break_penalty(text, i, fnt.size)
+            score = abs(wa - wb) / fnt.size + pen * 1.8   # 長さのバランスより、区切りの自然さを重視
+            if best_score is None or score < best_score:
+                best, best_score, best_pen = [a, b], score, pen
+        if best:
+            return best, best_pen
+    return greedy_wrap(text, fnt, max_width, draw), 9
+
+
+def fit_text(text, draw, max_width, sizes, weight="black", max_lines=2):
+    """大きい文字から順に試し、自然な区切りで収まる最大サイズを選ぶ"""
+    fallback = None
+    for size in sizes:
+        fnt = jp_font(size, weight)
+        lines, pen = smart_wrap(text, fnt, max_width, draw, max_lines)
+        if len(lines) > max_lines:
+            continue
+        if pen <= 0:
+            return fnt, lines
+        if fallback is None or pen < fallback[2]:
+            fallback = (fnt, lines, pen)
+    if fallback:
+        return fallback[0], fallback[1]
+    fnt = jp_font(sizes[-1], weight)
+    return fnt, smart_wrap(text, fnt, max_width, draw, max_lines)[0][:max_lines]
+
+
+# ============================================================
+#  写真のコマ
+# ============================================================
+
+def load_image(src):
+    img = Image.open(src)
+    img = ImageOps.exif_transpose(img)
+    return img.convert("RGB")
+
+
+def cover(img, w, h, fx=0.5, fy=0.5, extra=1.0):
+    """枠いっぱいに広げて切り取る。fx,fy は残したい位置（0〜1）、extra は寄りの倍率"""
+    scale = max(w / img.width, h / img.height) * extra
+    rw, rh = max(w, round(img.width * scale)), max(h, round(img.height * scale))
+    resized = img.resize((rw, rh), Image.LANCZOS)
+    left = int(min(max(fx * rw - w / 2, 0), rw - w))
+    top = int(min(max(fy * rh - h / 2, 0), rh - h))
+    return resized.crop((left, top, left + w, top + h))
+
+
+def pastel_blur_bg(img):
+    """写真をぼかして明るく・ピンク寄りにした背景"""
+    bg = cover(img, W, H).filter(ImageFilter.GaussianBlur(40))
+    bg = Image.blend(bg, Image.new("RGB", (W, H), CREAM), 0.45)
+    return Image.blend(bg, Image.new("RGB", (W, H), BLUSH), 0.2)
+
+
+def frame_fit(img, out_path, photo_center_y=980):
+    """写真の全体が見えるよう横幅いっぱいに置き、上下はぼかし背景（最初と最後のカット）"""
+    bg = pastel_blur_bg(img).convert("RGBA")
+    scale = W / img.width
+    if img.height * scale > 1300:                     # 縦長すぎる写真は少し縮める
+        scale = 1300 / img.height
+    photo = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+    y = photo_center_y - photo.height // 2
+    mask = Image.new("L", photo.size, 255)            # 上下のふちをなじませる
+    md = ImageDraw.Draw(mask)
+    fade = 50
+    for i in range(fade):
+        a = int(255 * i / fade)
+        md.line((0, i, photo.width, i), fill=a)
+        md.line((0, photo.height - 1 - i, photo.width, photo.height - 1 - i), fill=a)
+    bg.paste(photo, ((W - photo.width) // 2, y), mask)
+    bg.convert("RGB").save(out_path, quality=95)
+
+
+def frame_cover(img, out_path, fx, fy, extra):
+    """全画面の寄りカット"""
+    cover(img, W, H, fx, fy, extra).save(out_path, quality=95)
+
+
+# ============================================================
+#  文字レイヤー
+# ============================================================
+
+def outlined_text(d, xy, text, fnt, fill, stroke, stroke_w):
+    """太いふちどり＋うしろに淡い影（TikTokの字幕風）"""
+    x, y = xy
+    d.text((x + 4, y + 7), text, font=fnt, fill=(120, 50, 80, 90), stroke_width=stroke_w, stroke_fill=(120, 50, 80, 90))
+    d.text((x, y), text, font=fnt, fill=fill, stroke_width=stroke_w, stroke_fill=stroke)
+
+
+def draw_sparkle(d, cx, cy, r, color):
+    pts = []
+    for k in range(8):
+        a = k * math.pi / 4
+        rr = r if k % 2 == 0 else r * 0.28
+        pts.append((cx + math.cos(a) * rr, cy + math.sin(a) * rr))
+    d.polygon(pts, fill=color)
+
+
+def text_block(d, lines, fnt, center_y, fill, stroke, stroke_w, gap=10):
+    total = len(lines) * fnt.size + (len(lines) - 1) * gap
+    y = center_y - total / 2 - fnt.size * 0.1
+    cx = SAFE_RIGHT / 2 + 30                       # 右のボタンを避けて、少し左寄りの中央
+    boxes = []
+    for ln in lines:
+        w = d.textlength(ln, font=fnt)
+        x = cx - w / 2
+        outlined_text(d, (x, y), ln, fnt, fill, stroke, stroke_w)
+        boxes.append((x, y, x + w, y + fnt.size))
+        y += fnt.size + gap
+    return boxes
+
+
+def make_hook_layer(out_path, text):
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    fnt, lines = fit_text(text, d, TEXT_MAX_W, [104, 96, 88, 80, 72], "black")
+    boxes = text_block(d, lines, fnt, HOOK_CENTER_Y, (255, 255, 255, 255), (*DEEP_PINK, 255), 14, gap=14)
+    x1, x2 = min(b[0] for b in boxes), max(b[2] for b in boxes)
+    y1, y2 = min(b[1] for b in boxes), max(b[3] for b in boxes)
+    draw_sparkle(d, x1 - 34, y1 + 4, 26, (255, 236, 150, 255))
+    draw_sparkle(d, x2 + 30, y2 - 4, 22, (255, 255, 255, 255))
+    draw_sparkle(d, x2 + 8, y1 - 24, 14, (255, 236, 150, 255))
+    layer.save(out_path)
+
+
+def make_caption_layer(out_path, text, idx):
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    if text:
+        fnt, lines = fit_text(text, d, TEXT_MAX_W, [86, 80, 74, 68, 62], "black")
+        # 白文字＋ピンクのふち と ピンク文字＋白のふち を交互に（単調にならないように）
+        if idx % 2 == 0:
+            text_block(d, lines, fnt, MID_CENTER_Y, (255, 255, 255, 255), (*DEEP_PINK, 255), 12)
+        else:
+            text_block(d, lines, fnt, MID_CENTER_Y, (*DEEP_PINK, 255), (255, 255, 255, 255), 12)
+    layer.save(out_path)
+
+
+def make_end_layer(out_path, question, title, price, brand):
+    """最後：上に問いかけの吹き出し、下に店名・商品名・価格・案内のカード"""
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    cx = SAFE_RIGHT / 2 + 30
+
+    if question:
+        qf, ql = fit_text(question, d, 760, [62, 56, 52, 48], "black")
+        lh = qf.size + 10
+        bh = len(ql) * lh - 10 + 60
+        bw = max(d.textlength(t, font=qf) for t in ql) + 90
+        top = HOOK_CENTER_Y - bh / 2
+        box = (cx - bw / 2, top, cx + bw / 2, top + bh)
+        d.rounded_rectangle((box[0] + 4, box[1] + 8, box[2] + 4, box[3] + 8), radius=40, fill=(120, 50, 80, 70))
+        d.rounded_rectangle(box, radius=40, fill=(255, 255, 255, 250), outline=(*DEEP_PINK, 255), width=6)
+        tail_x = cx - bw / 4
+        d.polygon([(tail_x - 26, box[3] - 3), (tail_x + 26, box[3] - 3), (tail_x - 6, box[3] + 40)], fill=(255, 255, 255, 250))
+        d.line([(tail_x - 26, box[3] - 1), (tail_x - 6, box[3] + 40), (tail_x + 26, box[3] - 1)], fill=(*DEEP_PINK, 255), width=6)
+        y = top + 30 - qf.size * 0.1
+        for t in ql:
+            w = d.textlength(t, font=qf)
+            d.text((cx - w / 2, y), t, font=qf, fill=(*TEXT, 255))
+            y += lh
+
+    tf, tl = fit_text(title, d, 760, [58, 52, 48, 44], "black") if title else (None, [])
+    pf = jp_font(56, "black")
+    cf = jp_font(40, "bold")
+    cta = "プロフィールのリンクから" + (" ♡" if has_glyph(cf, "♡") else "")
+    bf = script_font(58)
+    name = brand.split()[0] if brand else "ninomae"
+    inner = bf.size + 6 + (len(tl) * (tf.size + 8) if tl else 0) + (pf.size + 20 + 28 if price else 0) + cf.size + 6
+    card_top = max(1060, SAFE_BOTTOM - inner - 60)
+    card = (90, card_top, SAFE_RIGHT - 20, card_top + inner + 60)
+    d.rounded_rectangle((card[0] + 6, card[1] + 12, card[2] + 6, card[3] + 12), radius=48, fill=(120, 50, 80, 60))
+    d.rounded_rectangle(card, radius=48, fill=(255, 255, 255, 242), outline=(*PINK, 255), width=5)
+    ccx = (card[0] + card[2]) / 2
+    y = card[1] + 26
+    w = d.textlength(name, font=bf)
+    d.text((ccx - w / 2, y - 8), name, font=bf, fill=(*MAUVE, 255))
+    y += bf.size + 6
+    for t in tl:
+        w = d.textlength(t, font=tf)
+        d.text((ccx - w / 2, y - tf.size * 0.1), t, font=tf, fill=(*TEXT, 255))
+        y += tf.size + 8
+    if price:
+        y += 10
+        w = d.textlength(price, font=pf)
+        ph = pf.size + 20
+        d.rounded_rectangle((ccx - w / 2 - 40, y, ccx + w / 2 + 40, y + ph), radius=ph // 2, fill=(*DEEP_PINK, 255))
+        d.text((ccx - w / 2, y + 10 - pf.size * 0.1), price, font=pf, fill=(255, 255, 255, 255))
+        y += ph + 18
+    w = d.textlength(cta, font=cf)
+    d.text((ccx - w / 2, y - cf.size * 0.1), cta, font=cf, fill=(*TEXT, 255))
+    draw_sparkle(d, card[0] + 30, card[1] + 26, 20, (*DEEP_PINK, 255))
+    draw_sparkle(d, card[2] - 32, card[3] - 30, 16, (*PINK, 255))
+    layer.save(out_path)
+
+
+# ============================================================
+#  BGM（120BPM・オルゴール風・オリジナル）
+# ============================================================
+
+def make_music_box(out_wav, cut_times):
+    sr = 48000
+    n = int(TOTAL_SEC * sr)
+    buf = np.zeros(n)
+    note = lambda m: 440.0 * 2 ** ((m - 69) / 12)
+    bar = BEAT * 4                                     # 2秒
+    # C → G → Am → F → C → G → C（7小節＝14秒）。最後はCで終わり、頭のCにつながる
+    chords = [[60, 64, 67], [55, 59, 62], [57, 60, 64], [53, 57, 60], [60, 64, 67], [55, 59, 62], [60, 64, 67]]
+    melody = [[84, 83, 79, 76], [79, 81, 83, 86], [84, 83, 81, 76], [77, 76, 74, 72],
+              [84, 86, 88, 84], [86, 83, 79, 83], [84, 79, 76, 72]]
+
+    def pluck(t0, freq, amp, decay, length=1.8):
+        i0 = int(t0 * sr)
+        ln = min(n - i0, int(length * sr))
+        if ln <= 0:
+            return
+        t = np.arange(ln) / sr
+        env = np.exp(-t * decay) * np.minimum(1, t / 0.002)
+        tone = (np.sin(2 * np.pi * freq * t)
+                + 0.35 * np.sin(2 * np.pi * freq * 2.0 * t) * np.exp(-t * decay * 1.6)
+                + 0.15 * np.sin(2 * np.pi * freq * 4.17 * t) * np.exp(-t * decay * 3.0))
+        buf[i0:i0 + ln] += amp * env * tone
+
+    def kick(t0, amp):
+        i0 = int(t0 * sr)
+        ln = min(n - i0, int(0.25 * sr))
+        if ln <= 0:
+            return
+        t = np.arange(ln) / sr
+        f = 110 * np.exp(-t * 18) + 45
+        buf[i0:i0 + ln] += amp * np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t * 14)
+
+    for b, ch in enumerate(chords):
+        t0 = b * bar
+        tones = [m + 12 for m in ch] + [m + 24 for m in ch]
+        pluck(t0, note(ch[0] - 12), 0.32, 1.4, 2.2)                     # 低音
+        for k in range(8):                                               # 8分音符のアルペジオ
+            pluck(t0 + k * BEAT / 2, note(tones[[0, 1, 2, 4, 3, 4, 2, 1][k]]), 0.13, 4.0)
+        for k, m in enumerate(melody[b]):                                # 4分音符のメロディ
+            pluck(t0 + k * BEAT, note(m), 0.20, 3.0)
+        for k in range(4):                                               # 軽いリズム
+            kick(t0 + k * BEAT, 0.28 if k % 2 == 0 else 0.18)
+    for ct in cut_times:                                                 # 切り替えの瞬間に「キラッ」
+        pluck(ct, note(96), 0.16, 6.0, 0.8)
+        pluck(ct, note(103), 0.10, 7.0, 0.8)
+
+    buf[: int(0.01 * sr)] *= np.linspace(0, 1, int(0.01 * sr))
+    buf[-int(0.03 * sr):] *= np.linspace(1, 0, int(0.03 * sr))       # ループで「プツッ」とならないように
+    buf = buf / (np.max(np.abs(buf)) + 1e-9) * 0.7
+    pcm = (buf * 32767).astype(np.int16)
+    with wave.open(out_wav, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(np.column_stack([pcm, pcm]).ravel().tobytes())
+
+
+def make_music(out_path, workdir, cut_times):
+    if BGM_MODE == "none":
+        log("BGM: なし（無音）")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                        "-t", f"{TOTAL_SEC:.3f}", "-c:a", "aac", "-b:a", "64k", out_path], check=True)
+        return
+    tracks = sorted(glob.glob("music/*.mp3") + glob.glob("music/*.m4a") + glob.glob("music/*.wav"))
+    if tracks:
+        track = random.choice(tracks)
+        log(f"BGM: {track}")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", track, "-t", str(TOTAL_SEC),
+                        "-af", f"volume=0.8,afade=t=out:st={TOTAL_SEC - 0.6}:d=0.6",
+                        "-ar", "48000", "-ac", "2", out_path], check=True)
+        return
+    log("BGM: 120BPMのオルゴール風（自動生成）")
+    raw = os.path.join(workdir, "musicbox.wav")
+    make_music_box(raw, cut_times)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
+                    "-af", "aecho=0.8:0.6:75:0.18,highpass=f=40,volume=0.95",
+                    "-ar", "48000", "-ac", "2", out_path], check=True)
+
+
+# ============================================================
+#  組み立て
+# ============================================================
+
+def render(payload, workdir):
+    ensure_fonts()
+    job_id = re.sub(r"[^0-9A-Za-z_-]", "", str(payload.get("job_id") or "test"))
+    brand = clean_text(payload.get("brand") or "ninomae ONLINE", 30)
+    slides = [clean_text(s, 32) for s in (payload.get("slides") or [])]
+    hook = slides[0] if slides and slides[0] else "枯れない花って知ってた？"
+    mids = (slides[1:] + [""] * N_MID)[:N_MID]
+    question = clean_text(payload.get("question"), 32)
+    title = clean_text(short_title(payload.get("title")), 40)
+    price = clean_text(payload.get("price"), 30)
+
+    sources = []
+    for i, src in enumerate((payload.get("images") or [])[:6]):
+        try:
+            path = src if os.path.exists(src) else download(src, os.path.join(workdir, f"src{i}.jpg"))
+            load_image(path)
+            sources.append(path)
+        except Exception as e:
+            log(f"画像を取得できませんでした: {src} / {e}")
+    if not sources:
+        sys.exit("使える商品写真がありません")
+    imgs = [load_image(p) for p in sources]
+
+    # 途中の4カット：写真が足りないときは、寄る位置と倍率を変えて別カットに見せる
+    focus = [(0.5, 0.45, 1.0), (0.35, 0.4, 1.35), (0.65, 0.55, 1.35), (0.5, 0.35, 1.6), (0.5, 0.6, 1.25)]
+    mid_frames = []
+    for k in range(N_MID):
+        img = imgs[(k + 1) % len(imgs)]
+        fx, fy, ex = focus[(k + (0 if len(imgs) > 2 else 1)) % len(focus)]
+        mid_frames.append((img, fx, fy, ex))
+
+    log("素材を作成中…")
+    segs = []   # (背景, 文字, 長さ, ズームの式, 文字の出し方)
+    f0, t0 = os.path.join(workdir, "f_hook.jpg"), os.path.join(workdir, "t_hook.png")
+    frame_fit(imgs[0], f0)
+    make_hook_layer(t0, hook)
+    # 最初：寄った状態（＝最後のカットの終わりと同じ倍率）から、グッと引いて止まる
+    segs.append((f0, t0, HOOK_SEC, f"1.0+{LOOP_ZOOM}*pow(max(0,1-t/0.35),2)+0.02*t/{HOOK_SEC}", "now"))
+    for k, (img, fx, fy, ex) in enumerate(mid_frames):
+        fp, tp = os.path.join(workdir, f"f_mid{k}.jpg"), os.path.join(workdir, f"t_mid{k}.png")
+        frame_cover(img, fp, fx, fy, ex)
+        make_caption_layer(tp, mids[k], k)
+        segs.append((fp, tp, MID_SEC, f"1.0+0.07*pow(max(0,1-t/0.22),2)+0.05*t/{MID_SEC}", "pop"))
+    fe, te = os.path.join(workdir, "f_end.jpg"), os.path.join(workdir, "t_end.png")
+    frame_fit(imgs[0], fe)
+    make_end_layer(te, question, title, price, brand)
+    # 最後：ゆっくり寄っていき、最初のカットの始まりと同じ倍率で終わる＝自然にループ
+    segs.append((fe, te, END_SEC, f"1.0+{LOOP_ZOOM}*t/{END_SEC}", "pop"))
+
+    inputs, filters, labels = [], [], []
+    for i, (bgp, txp, dur, z, mode) in enumerate(segs):
+        inputs += ["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", bgp,
+                   "-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", txp]
+        a, b = 2 * i, 2 * i + 1
+        if mode == "now":
+            txt = f"[{b}:v]format=rgba[tx{i}];[bz{i}][tx{i}]overlay=0:0:format=auto"
+        else:
+            # ポンッと出る：少し下から一瞬で上がり、同時に表示
+            txt = (f"[{b}:v]format=rgba,fade=t=in:st=0.05:d=0.12:alpha=1[tx{i}];"
+                   f"[bz{i}][tx{i}]overlay=x=0:y='if(lt(t,0.05),40,if(lt(t,0.2),40*(1-(t-0.05)/0.15),0))':format=auto")
+        filters.append(
+            f"[{a}:v]scale=w='trunc({W}*({z})/2)*2':h='trunc({H}*({z})/2)*2':eval=frame,"
+            f"crop={W}:{H},setsar=1,fps={FPS},format=yuv420p[bz{i}];"
+            f"{txt},format=yuv420p,setsar=1[s{i}]"
+        )
+        labels.append(f"[s{i}]")
+    filters.append("".join(labels) + f"concat=n={len(segs)}:v=1:a=0[v]")
+
+    cut_times = [HOOK_SEC + MID_SEC * k for k in range(N_MID + 1)]
+    music = os.path.join(workdir, "music.m4a")
+    make_music(music, workdir, cut_times)
+    inputs += ["-i", music]
+    audio_idx = len(segs) * 2
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    out = os.path.join(OUT_DIR, f"{job_id}.mp4")
+    log("動画を書き出し中…")
+    cmd = (["ffmpeg", "-y", "-loglevel", "error"] + inputs +
+           ["-filter_complex", ";".join(filters), "-map", "[v]", "-map", f"{audio_idx}:a",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-r", str(FPS), "-g", str(FPS),
+            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
+            "-t", f"{TOTAL_SEC:.3f}", "-movflags", "+faststart", out])
+    subprocess.run(cmd, check=True)
+    log(f"完成: {out}（{os.path.getsize(out) / 1024 / 1024:.1f} MB・{TOTAL_SEC:.0f}秒）")
+    return out
+
+
+def main():
+    raw = os.environ.get("PAYLOAD") or (open(sys.argv[1], encoding="utf-8").read() if len(sys.argv) > 1 else "")
+    if not raw or raw == "null":
+        sys.exit("PAYLOAD がありません")
+    payload = json.loads(raw)
+    if isinstance(payload, dict) and isinstance(payload.get("payload"), str):
+        payload = json.loads(payload["payload"])
+    with tempfile.TemporaryDirectory() as tmp:
+        render(payload, tmp)
+
+
+if __name__ == "__main__":
+    main()
