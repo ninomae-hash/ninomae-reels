@@ -1,5 +1,5 @@
 # ninomae ONLINE リール動画を作って GitHub Pages に公開する
-# GAS（Google Apps Script）から依頼が来ると動きます。手動でテストすることもできます。
+# GAS(Google Apps Script)から依頼が来ると動きます。手動でテストすることもできます。
 name: リール動画を作成
 
 on:
@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       payload:
-        description: "テスト用の内容（JSON）。そのまま「Run workflow」でテスト動画を作れます"
+        description: "テスト用の内容(JSON)。そのまま「Run workflow」でテスト動画を作れます"
         required: true
-        default: '{"job_id":"00000000-manual-test","images":["https://baseec-img-mng.akamaized.net/images/item/origin/06a86453fa49fdb3fbf50258dc7fdb6e.jpg","https://baseec-img-mng.akamaized.net/images/item/origin/f2ba113c9aaaa487da5773aba541ffb4.jpg"],"slides":["小さな花束に、想いを込めて","水やり不要で長く楽しめる","誕生日や記念日の贈り物に"],"title":"プリザーブドフラワーブーケ｜花束 ピンク","price":"¥9,240（税込）","brand":"ninomae ONLINE"}'
+        default: '{"job_id":"00000000-manual-test","images":["https://baseec-img-mng.akamaized.net/images/item/origin/06a86453fa49fdb3fbf50258dc7fdb6e.jpg","https://baseec-img-mng.akamaized.net/images/item/origin/f2ba113c9aaaa487da5773aba541ffb4.jpg"],"slides":["小さな花束に、想いを込めて","水やり不要で長く楽しめる","誕生日や記念日の贈り物に"],"title":"プリザーブドフラワーブーケ|花束 ピンク","price":"¥9,240(税込)","brand":"ninomae ONLINE"}'
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
       - name: プログラムを取り出す
         uses: actions/checkout@v4
 
-      - name: 必要なソフト（動画編集・日本語フォント）を入れる
+      - name: 必要なソフト(動画編集・日本語フォント)を入れる
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-noto-cjk
@@ -59,15 +59,15 @@ jobs:
 
           mkdir -p reels
           cp "../$VIDEO" reels/
-          # 新しい順に6本だけ残す（ファイル名が日時で始まるので、名前の降順＝新しい順）
+          # 新しい順に6本だけ残す(ファイル名が日時で始まるので、名前の降順=新しい順)
           ls reels/*.mp4 | sort -r | tail -n +7 | xargs -r rm -f
           touch .nojekyll
           printf '<!doctype html><meta charset="utf-8"><title>ninomae reels</title><p>ninomae ONLINE reels</p>\n' > index.html
 
-          # 履歴を残さず常に1コミットだけにする（動画でリポジトリが大きくならないように）
+          # 履歴を残さず常に1コミットだけにする(動画でリポジトリが大きくならないように)
           git checkout -q --orphan publish
           git add -A
           git commit -q -m "reel: $NAME"
           git push -q -f origin publish:gh-pages
 
-          echo "公開URL（反映まで1〜2分かかります）: https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/reels/$NAME"
+          echo "公開URL(反映まで1〜2分かかります): https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/reels/$NAME"
