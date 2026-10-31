@@ -50,10 +50,10 @@ MID_SEC = 2.0                       # 途中のカット（4つ）
 END_SEC = 3.5                       # 最後（商品名・価格・問いかけ）
 N_MID = 4
 TOTAL_SEC = HOOK_SEC + MID_SEC * N_MID + END_SEC   # 14.0秒
-LOOP_ZOOM = 0.10
+LOOP_ZOOM = 0.10                    # 最後のカットの終わり＝最初のカットの始まりの寄り具合（ループ用）
 # BGM："none"＝音なし（曲はTikTok・Instagramのアプリで付ける）／"musicbox"＝オルゴール風の自作曲
 # ※音なしでも、SNSが受け付けやすいように「無音の音声トラック」は入れておく
-BGM_MODE = "none"                    # 最後のカットの終わり＝最初のカットの始まりの寄り具合（ループ用）
+BGM_MODE = "none"
 OUT_DIR = "out"
 
 # ---- 色（ninomae ONLINE のテーマに合わせたピンク系） ----
@@ -422,7 +422,7 @@ def make_end_layer(out_path, question, title, price, brand):
     cf = jp_font(40, "bold")
     cta = "プロフィールのリンクから" + (" ♡" if has_glyph(cf, "♡") else "")
     bf = script_font(58)
-    name = brand.split()[0] if brand else "ninomae"
+    name = brand or "ninomae ONLINE"             # 店名はそのまま（例：ninomae ONLINE）
     inner = bf.size + 6 + (len(tl) * (tf.size + 8) if tl else 0) + (pf.size + 20 + 28 if price else 0) + cf.size + 6
     card_top = max(1060, SAFE_BOTTOM - inner - 60)
     card = (90, card_top, SAFE_RIGHT - 20, card_top + inner + 60)
