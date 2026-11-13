@@ -328,6 +328,28 @@ def frame_fit(img, out_path, photo_center_y=980):
     bg.convert("RGB").save(out_path, quality=95)
 
 
+def frame_fit_band(img, out_path, band_top, band_bottom):
+    """最後のカット用：吹き出しとカードのあいだに写真を収める。
+    背景は最後に LOOP_ZOOM 分だけ中心から拡大するので、拡大後も重ならない位置に置く"""
+    z = 1 + LOOP_ZOOM
+    cy = H / 2
+    top = cy + (band_top - cy) / z           # 拡大したとき、吹き出しの下に余白が残る位置
+    bottom = cy + (band_bottom - cy) / z     # 拡大したとき、カードの上に余白が残る位置
+    bg = pastel_blur_bg(img).convert("RGBA")
+    scale = min(W / img.width, (bottom - top) / img.height)
+    photo = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+    y = round((top + bottom) / 2 - photo.height / 2)
+    mask = Image.new("L", photo.size, 255)
+    md = ImageDraw.Draw(mask)
+    fade = 40
+    for i in range(fade):
+        a = int(255 * i / fade)
+        md.line((0, i, photo.width, i), fill=a)
+        md.line((0, photo.height - 1 - i, photo.width, photo.height - 1 - i), fill=a)
+    bg.paste(photo, ((W - photo.width) // 2, y), mask)
+    bg.convert("RGB").save(out_path, quality=95)
+
+
 def frame_cover(img, out_path, fx, fy, extra):
     """全画面の寄りカット"""
     cover(img, W, H, fx, fy, extra).save(out_path, quality=95)
@@ -393,24 +415,32 @@ def make_caption_layer(out_path, text, idx):
     layer.save(out_path)
 
 
+END_BUBBLE_TOP = SAFE_TOP + 10      # 最後の吹き出しの上端（写真と重ならないよう上に置く）
+END_GAP = 44                        # 吹き出し・カードと写真のあいだの余白
+END_CARD_TOP = 1200                 # 店名カードの上端の下限（下に寄せるほど写真が大きくなる）
+
+
 def make_end_layer(out_path, question, title, price, brand):
-    """最後：上に問いかけの吹き出し、下に店名・商品名・価格・案内のカード"""
+    """最後：上に問いかけの吹き出し、下に店名・商品名・価格・案内のカード
+    戻り値：(吹き出しの下端, カードの上端)。写真はこの間に置く"""
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
     cx = SAFE_RIGHT / 2 + 30
+    bubble_bottom = SAFE_TOP
 
     if question:
-        qf, ql = fit_text(question, d, 760, [62, 56, 52, 48], "black")
+        qf, ql = fit_text(question, d, 680, [50, 46, 42, 38], "black")   # 最後の吹き出しは小さめ（写真を大きくするため）
         lh = qf.size + 10
         bh = len(ql) * lh - 10 + 60
-        bw = max(d.textlength(t, font=qf) for t in ql) + 90
-        top = HOOK_CENTER_Y - bh / 2
+        bw = max(d.textlength(t, font=qf) for t in ql) + 70
+        top = END_BUBBLE_TOP
         box = (cx - bw / 2, top, cx + bw / 2, top + bh)
         d.rounded_rectangle((box[0] + 4, box[1] + 8, box[2] + 4, box[3] + 8), radius=40, fill=(120, 50, 80, 70))
         d.rounded_rectangle(box, radius=40, fill=(255, 255, 255, 250), outline=(*DEEP_PINK, 255), width=6)
         tail_x = cx - bw / 4
         d.polygon([(tail_x - 26, box[3] - 3), (tail_x + 26, box[3] - 3), (tail_x - 6, box[3] + 40)], fill=(255, 255, 255, 250))
         d.line([(tail_x - 26, box[3] - 1), (tail_x - 6, box[3] + 40), (tail_x + 26, box[3] - 1)], fill=(*DEEP_PINK, 255), width=6)
+        bubble_bottom = box[3] + 40                # しっぽの先まで
         y = top + 30 - qf.size * 0.1
         for t in ql:
             w = d.textlength(t, font=qf)
@@ -424,8 +454,9 @@ def make_end_layer(out_path, question, title, price, brand):
     bf = script_font(58)
     name = brand or "ninomae ONLINE"             # 店名はそのまま（例：ninomae ONLINE）
     inner = bf.size + 6 + (len(tl) * (tf.size + 8) if tl else 0) + (pf.size + 20 + 28 if price else 0) + cf.size + 6
-    card_top = max(1060, SAFE_BOTTOM - inner - 60)
+    card_top = max(END_CARD_TOP, SAFE_BOTTOM - inner - 60)   # 店名カードは下めに置く
     card = (90, card_top, SAFE_RIGHT - 20, card_top + inner + 60)
+    geometry = (bubble_bottom, card_top)
     d.rounded_rectangle((card[0] + 6, card[1] + 12, card[2] + 6, card[3] + 12), radius=48, fill=(120, 50, 80, 60))
     d.rounded_rectangle(card, radius=48, fill=(255, 255, 255, 242), outline=(*PINK, 255), width=5)
     ccx = (card[0] + card[2]) / 2
@@ -449,6 +480,7 @@ def make_end_layer(out_path, question, title, price, brand):
     draw_sparkle(d, card[0] + 30, card[1] + 26, 20, (*DEEP_PINK, 255))
     draw_sparkle(d, card[2] - 32, card[3] - 30, 16, (*PINK, 255))
     layer.save(out_path)
+    return geometry
 
 
 # ============================================================
@@ -583,8 +615,8 @@ def render(payload, workdir):
         make_caption_layer(tp, mids[k], k)
         segs.append((fp, tp, MID_SEC, f"1.0+0.07*pow(max(0,1-t/0.22),2)+0.05*t/{MID_SEC}", "pop"))
     fe, te = os.path.join(workdir, "f_end.jpg"), os.path.join(workdir, "t_end.png")
-    frame_fit(imgs[0], fe)
-    make_end_layer(te, question, title, price, brand)
+    bubble_bottom, card_top = make_end_layer(te, question, title, price, brand)
+    frame_fit_band(imgs[0], fe, bubble_bottom + END_GAP, card_top - END_GAP)
     # 最後：ゆっくり寄っていき、最初のカットの始まりと同じ倍率で終わる＝自然にループ
     segs.append((fe, te, END_SEC, f"1.0+{LOOP_ZOOM}*t/{END_SEC}", "pop"))
 
